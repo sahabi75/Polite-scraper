@@ -1,181 +1,99 @@
-import time
-from datetime import datetime, timezone
+import json
+import re
 from pathlib import Path
-from urllib.parse import urljoin
+from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
-
-START_URL = "https://books.toscrape.com/catalogue/page-1.html"
-USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/sahabi75/Polite-scraper)"
-TIMEOUT = 20  # seconds
-DELAY = 0.6  # seconds between real requests (must be at least 0.5)
-MAX_PAGES = 3
+from pydantic import BaseModel, ValidationError, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CACHE_DIR = PROJECT_ROOT / "cache"
+OUTPUT_DIR = PROJECT_ROOT / "output"
 
 
-def fetch_html(url, cache_name):
-    """Return the HTML for a URL. Read from cache if it exists, otherwise fetch."""
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path = CACHE_DIR / cache_name
+class Book(BaseModel):
+    """The shape of a finished, clean record."""
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: Optional[str] = None  # the only optional field
+    source_page: str
+    fetched_at: str
 
-    if cache_path.exists():
-        html = cache_path.read_text(encoding="utf-8")
-        print(f"CACHE HIT {url} ({len(html)} chars)")
-        return html
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def must_be_https(cls, value):
+        if not value.startswith("https://"):
+            raise ValueError("URL must start with https://")
+        return value
 
-    for attempt in (1, 2):  # one try + one retry
-        time.sleep(DELAY)  # only real requests wait; cache hits never reach here
-        try:
-            response = requests.get(
-                url,
-                headers={"User-Agent": USER_AGENT},
-                timeout=TIMEOUT,
-            )
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            print(f"TIMEOUT {url} (attempt {attempt})")
-            continue
+    @field_validator("title")
+    @classmethod
+    def title_not_empty(cls, value):
+        if not value.strip():
+            raise ValueError("title is empty")
+        return value
 
-        if response.status_code >= 500:
-            print(f"SERVER ERROR {url} (status {response.status_code}, attempt {attempt})")
-            continue
-
-        if response.status_code != 200:
-            print(f"FAILED {url} (status {response.status_code})")
-            return None  # 404, 403 etc: never retry
-
-        response.encoding = "utf-8"
-        html = response.text
-        cache_path.write_text(html, encoding="utf-8")
-        print(f"FETCH {url} ({len(html)} chars)")
-        return html
-
-    print(f"GIVING UP {url}")
-    return None
+    @field_validator("price_gbp")
+    @classmethod
+    def price_not_negative(cls, value):
+        if value < 0:
+            raise ValueError("price cannot be negative")
+        return value
 
 
-def get_fetched_at(cache_name):
-    """When the cached file was saved, as an ISO timestamp (our provenance)."""
-    modified = (CACHE_DIR / cache_name).stat().st_mtime
-    return datetime.fromtimestamp(modified, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# ---------- Stage 2: discover book URLs ----------
-
-def get_book_links(html, page_url):
-    """Return absolute URLs of every book listed on a catalogue page."""
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.select("article.product_pod h3 a"):
-        links.append(urljoin(page_url, a["href"]))
-    return links
-
-
-def get_next_page_url(html, page_url):
-    """Return the absolute URL of the 'next' page, or None if there isn't one."""
-    soup = BeautifulSoup(html, "html.parser")
-    next_link = soup.select_one("li.next a")
-    if next_link is None:
+def parse_price(price_text):
+    """'£51.77' -> 51.77. Returns None if no number is found."""
+    if not price_text:
         return None
-    return urljoin(page_url, next_link["href"])
+    match = re.search(r"\d+(?:\.\d+)?", price_text)
+    if match is None:
+        return None
+    return float(match.group())
 
 
-def discover_books():
-    """Walk the first MAX_PAGES catalogue pages.
-    Returns (pages_visited, total_links_found, unique_books).
-    Each unique book is {"url": ..., "source_page": ...}."""
-    page_url = START_URL
-    pages_visited = 0
-    found = []
-
-    while page_url and pages_visited < MAX_PAGES:
-        page_number = pages_visited + 1
-        html = fetch_html(page_url, f"catalogue-page-{page_number}.html")
-        if html is None:
-            break
-
-        for link in get_book_links(html, page_url):
-            found.append({"url": link, "source_page": page_url})
-        pages_visited += 1
-        page_url = get_next_page_url(html, page_url)
-
-    # remove duplicate URLs, keep the first one seen
-    seen = set()
-    unique_books = []
-    for book in found:
-        if book["url"] not in seen:
-            seen.add(book["url"])
-            unique_books.append(book)
-
-    return pages_visited, len(found), unique_books
+def normalize(raw):
+    """Add the clean value next to the raw one. The raw text is kept."""
+    clean = dict(raw)
+    clean["price_gbp"] = parse_price(raw.get("price_text"))
+    return clean
 
 
-# ---------- Stage 3: extract raw records ----------
-
-def extract_book(html, product_url, source_page, fetched_at):
-    """Turn one book page into a raw record (all values still plain text)."""
-    soup = BeautifulSoup(html, "html.parser")
-    product = soup.select_one("article.product_page")  # only look inside the product area
-
-    title = product.select_one("div.product_main h1").get_text(strip=True)
-    price_text = product.select_one("div.product_main p.price_color").get_text(strip=True)
-
-    availability = product.select_one("div.product_main p.availability")
-    availability_text = " ".join(availability.get_text().split())
-
-    rating_tag = product.select_one("div.product_main p.star-rating")
-    rating_classes = [c for c in rating_tag["class"] if c != "star-rating"]
-    rating_text = rating_classes[0] if rating_classes else None
-
-    # the description is the <p> right after the #product_description heading
-    description_tag = product.select_one("#product_description + p")
-    description = description_tag.get_text(strip=True) if description_tag else None
-
-    return {
-        "title": title,
-        "product_url": product_url,
-        "price_text": price_text,
-        "availability_text": availability_text,
-        "rating_text": rating_text,
-        "description": description,
-        "source_page": source_page,
-        "fetched_at": fetched_at,
-    }
+def format_errors(error):
+    """Turn a Pydantic error into one readable line."""
+    parts = []
+    for err in error.errors():
+        field = ".".join(str(x) for x in err["loc"])
+        parts.append(f"{field}: {err['msg']}")
+    return "; ".join(parts)
 
 
-def extract_all_books(books):
-    """Fetch (or read from cache) every book page and extract its raw record."""
-    records = []
-    for book in books:
-        slug = book["url"].split("/")[-2]  # e.g. a-light-in-the-attic_1000
-        cache_name = f"book-{slug}.html"
-
-        html = fetch_html(book["url"], cache_name)
-        if html is None:
-            continue  # skip pages that failed
-
-        records.append(
-            extract_book(html, book["url"], book["source_page"], get_fetched_at(cache_name))
-        )
-    return records
+def save_json(data, filename):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path = OUTPUT_DIR / filename
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def main():
-    pages_visited, total_found, books = discover_books()
-    print(f"catalogue_pages={pages_visited}")
-    print(f"discovered={total_found}")
-    print(f"unique_urls={len(books)}")
+def clean_and_store(raw_records):
+    """Normalize + validate every record. Good ones go to books.json,
+    bad ones go to errors.json with a reason."""
+    good = {}  # keyed by product_url, so duplicates count once
+    errors = []
 
-    records = extract_all_books(books)
-    print(f"detail_pages={len(records)}")
+    for raw in raw_records:
+        record = normalize(raw)
+        try:
+            book = Book(**record)
+        except ValidationError as e:
+            errors.append({
+                "product_url": raw.get("product_url"),
+                "reason": format_errors(e),
+                "record": raw,
+            })
+            continue
+        good[book.product_url] = book.model_dump()
 
-    if records:
-        print("Sample record:")
-        for key, value in records[0].items():
-            print(f"  {key}: {value}")
-
-
-if __name__ == "__main__":
-    main()
+    save_json(list(good.values()), "books.json")
+    save_json(errors, "errors.json")
+    return len(good), len(errors)
